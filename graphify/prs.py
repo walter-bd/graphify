@@ -629,9 +629,19 @@ def triage_with_opus(prs: list[PRInfo], base: str) -> None:
             cfg = BACKENDS[backend]
             api_key = _get_backend_api_key(backend) or "ollama"
             client = OpenAI(api_key=api_key, base_url=cfg.get("base_url", ""))
+            kwargs = {
+                "model": model,
+                "max_tokens": 1024,
+                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            service_tier_env = cfg.get("service_tier_env_key")
+            if service_tier_env:
+                service_tier = os.environ.get(service_tier_env, "").strip()
+                if service_tier:
+                    kwargs["service_tier"] = service_tier
             with client.chat.completions.create(
-                model=model, max_tokens=1024, stream=True,
-                messages=[{"role": "user", "content": prompt}],
+                **kwargs,
             ) as stream:
                 print("  ", end="", flush=True)
                 for chunk in stream:

@@ -88,6 +88,54 @@ def test_gemini_model_can_be_overridden_by_env(tmp_path, monkeypatch):
     assert call.call_args.args[2] == "gemini-3.1-pro-preview"
 
 
+def test_openai_service_tier_can_be_overridden_by_env(monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("GRAPHIFY_OPENAI_SERVICE_TIER", "flex")
+    captured = {}
+
+    class _FakeResponse:
+        def __init__(self):
+            self.choices = [type("Choice", (), {"message": type("Msg", (), {"content": '{"nodes":[],"edges":[],"hyperedges":[]}'})(), "finish_reason": "stop"})()]
+            self.usage = type("Usage", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+
+    class _FakeCompletions:
+        def __init__(self):
+            self.kwargs = None
+
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return _FakeResponse()
+
+    class _FakeChat:
+        def __init__(self):
+            self.completions = _FakeCompletions()
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.chat = _FakeChat()
+            captured["client"] = self
+
+    monkeypatch.setattr("openai.OpenAI", _FakeClient)
+    result = llm._call_openai_compat(
+        "https://api.openai.com/v1",
+        "openai-key",
+        "gpt-4.1-mini",
+        "=== note.md ===\n# Architecture\n",
+        backend="openai",
+    )
+
+    assert result["model"] == "gpt-4.1-mini"
+    assert result["finish_reason"] == "stop"
+    assert captured["client"].chat.completions.kwargs["service_tier"] == "flex"
+    assert llm._service_tier_for_backend("openai") == "flex"
+
+
+def test_openai_default_model_is_gpt_5_mini(monkeypatch):
+    _clear_backend_env(monkeypatch)
+    assert llm._default_model_for_backend("openai") == "gpt-5-mini"
+
+
 def test_missing_gemini_key_names_both_supported_env_vars(monkeypatch):
     _clear_backend_env(monkeypatch)
 

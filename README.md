@@ -322,6 +322,7 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `ANTHROPIC_API_KEY` | Claude (Anthropic) backend | `--backend claude` |
 | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Google Gemini backend | `--backend gemini` |
 | `OPENAI_API_KEY` | OpenAI or OpenAI-compatible APIs | `--backend openai` |
+| `GRAPHIFY_OPENAI_SERVICE_TIER` | Optional OpenAI service tier override, e.g. `flex` | `--backend openai` |
 | `DEEPSEEK_API_KEY` | DeepSeek backend | `--backend deepseek` |
 | `MOONSHOT_API_KEY` | Kimi Code backend | `--backend kimi` |
 | `OLLAMA_BASE_URL` | Ollama local inference URL | `--backend ollama` (default: `http://localhost:11434`) |

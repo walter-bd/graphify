@@ -81,11 +81,13 @@ BACKENDS: dict[str, dict] = {
     },
     "openai": {
         "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-4.1-mini",
+        "default_model": "gpt-5-mini",
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "GRAPHIFY_OPENAI_MODEL",
+        "service_tier_env_key": "GRAPHIFY_OPENAI_SERVICE_TIER",
         "pricing": {"input": 0.40, "output": 1.60},  # USD per 1M tokens
-        "temperature": 0,
+        "temperature": None,
+        "reasoning_effort": "low",
     },
     "deepseek": {
         "base_url": "https://api.deepseek.com",
@@ -249,6 +251,16 @@ def _default_model_for_backend(backend: str) -> str:
     return cfg["default_model"]
 
 
+def _service_tier_for_backend(backend: str) -> str | None:
+    """Return an optional service tier override for a backend."""
+    cfg = BACKENDS[backend]
+    tier_env_key = cfg.get("service_tier_env_key")
+    if not tier_env_key:
+        return None
+    tier = os.environ.get(tier_env_key, "").strip()
+    return tier or None
+
+
 def _call_openai_compat(
     base_url: str,
     api_key: str,
@@ -297,6 +309,9 @@ def _call_openai_compat(
         kwargs["temperature"] = temperature
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    service_tier = _service_tier_for_backend(backend)
+    if service_tier is not None:
+        kwargs["service_tier"] = service_tier
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -344,7 +359,21 @@ def _call_openai_compat(
             num_ctx = auto_num_ctx
         keep_alive = os.environ.get("GRAPHIFY_OLLAMA_KEEP_ALIVE", "30m")
         kwargs["extra_body"] = {"options": {"num_ctx": num_ctx}, "keep_alive": keep_alive}
-    resp = client.chat.completions.create(**kwargs)
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        service_tier = kwargs.get("service_tier")
+        message = str(exc).lower()
+        if service_tier and "service_tier" in message and "invalid" in message:
+            print(
+                f"[graphify] warning: backend={backend} rejected service_tier={service_tier!r}; "
+                "retrying without service_tier.",
+                file=sys.stderr,
+            )
+            kwargs.pop("service_tier", None)
+            resp = client.chat.completions.create(**kwargs)
+        else:
+            raise
     if not resp.choices or resp.choices[0].message is None:
         raise ValueError("LLM returned empty or filtered response")
     raw_content = resp.choices[0].message.content
