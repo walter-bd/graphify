@@ -2,12 +2,18 @@
 from __future__ import annotations
 import json
 import math
+import re
 import sys
 from pathlib import Path
 import networkx as nx
 from networkx.readwrite import json_graph
-from graphify.security import sanitize_label
+from graphify.security import sanitize_label, check_graph_file_size_cap
 from graphify.build import edge_data
+
+try:
+    import jieba as _jieba  # type: ignore[import-untyped]
+except ImportError:
+    _jieba = None
 
 
 def _load_graph(graph_path: str) -> nx.Graph:
@@ -17,6 +23,7 @@ def _load_graph(graph_path: str) -> nx.Graph:
             raise ValueError(f"Graph path must be a .json file, got: {graph_path!r}")
         if not resolved.exists():
             raise FileNotFoundError(f"Graph file not found: {resolved}")
+        check_graph_file_size_cap(resolved)
         safe = resolved
         data = json.loads(safe.read_text(encoding="utf-8"))
         if "links" not in data and "edges" in data:
@@ -48,6 +55,50 @@ def _strip_diacritics(text: str) -> str:
     import unicodedata
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _search_tokens(text: str) -> list[str]:
+    """Split text into word tokens, stripping punctuation and diacritics."""
+    return re.findall(r"\w+", _strip_diacritics(str(text)).lower())
+
+
+def _has_chinese(text: str) -> bool:
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
+def _segment_chinese(text: str) -> list[str]:
+    """Segment Chinese text and keep the original term for exact matching."""
+    if _jieba is not None:
+        segments = [w for w in _jieba.cut(text) if len(w.strip()) > 0]
+    else:
+        segments = [text[i:i + 2] for i in range(len(text) - 1)] or [text]
+    if len(text) > 1 and text not in segments:
+        segments.append(text)
+    return segments
+
+
+def _is_searchable(term: str) -> bool:
+    """True if term is Chinese, non-English, or an English word longer than 2 chars."""
+    if all("a" <= ch <= "z" for ch in term):
+        return len(term) > 2
+    return True
+
+
+def _query_terms(question: str) -> list[str]:
+    """Split a query into searchable terms, segmenting Chinese text."""
+    terms: list[str] = []
+    for raw in question.split():
+        if _has_chinese(raw):
+            for seg in _segment_chinese(raw.lower().strip()):
+                seg = seg.strip()
+                if seg and _is_searchable(seg):
+                    terms.append(seg)
+        else:
+            # Strip punctuation without touching Unicode characters (avoid NFKD mangling non-Latin scripts)
+            for tok in re.findall(r"\w+", raw.lower()):
+                if _is_searchable(tok):
+                    terms.append(tok)
+    return terms
 
 
 _EXACT_MATCH_BONUS = 1000.0
@@ -83,7 +134,7 @@ def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
     scored = []
-    norm_terms = [_strip_diacritics(t).lower() for t in terms]
+    norm_terms = [tok for t in terms for tok in _search_tokens(t)]
     idf = _compute_idf(G, norm_terms)
     for nid, data in G.nodes(data=True):
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
@@ -136,6 +187,44 @@ _CONTEXT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+_CONTEXT_FILTER_ALIASES: dict[str, str] = {
+    "param": "parameter_type",
+    "params": "parameter_type",
+    "parameter": "parameter_type",
+    "parameters": "parameter_type",
+    "argument": "parameter_type",
+    "arguments": "parameter_type",
+    "arg": "parameter_type",
+    "args": "parameter_type",
+    "return": "return_type",
+    "returns": "return_type",
+    "returned": "return_type",
+    "generic": "generic_arg",
+    "generics": "generic_arg",
+    "template": "generic_arg",
+    "templates": "generic_arg",
+    "annotation": "attribute",
+    "annotations": "attribute",
+    "decorator": "attribute",
+    "decorators": "attribute",
+    "calls": "call",
+    "called": "call",
+    "invoke": "call",
+    "invocation": "call",
+    "fields": "field",
+    "property": "field",
+    "properties": "field",
+    "member": "field",
+    "members": "field",
+    "imports": "import",
+    "imported": "import",
+    "module": "import",
+    "modules": "import",
+    "exports": "export",
+    "exported": "export",
+}
+
+
 def _normalize_context_filters(filters: list[str] | None) -> list[str]:
     if not filters:
         return []
@@ -143,7 +232,10 @@ def _normalize_context_filters(filters: list[str] | None) -> list[str]:
     seen: set[str] = set()
     for value in filters:
         key = _strip_diacritics(str(value)).strip().lower()
-        if key and key not in seen:
+        if not key:
+            continue
+        key = _CONTEXT_FILTER_ALIASES.get(key, key)
+        if key not in seen:
             seen.add(key)
             normalized.append(key)
     return normalized
@@ -306,7 +398,7 @@ def _query_graph_text(
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
 ) -> str:
-    terms = [t.lower() for t in question.split() if len(t) > 2]
+    terms = _query_terms(question)
     scored = _score_nodes(G, terms)
     start_nodes = _pick_seeds(scored)
     if not start_nodes:
@@ -331,7 +423,9 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
     Results are ordered by three-tier precedence: exact match, then prefix match,
     then substring match. Node-ID exact matches are grouped with label exact matches.
     """
-    term = _strip_diacritics(label).lower()
+    term = " ".join(_search_tokens(label))
+    if not term:
+        return []
     exact: list[str] = []
     prefix: list[str] = []
     substring: list[str] = []
@@ -388,7 +482,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         from mcp import types
         from mcp.types import AnyUrl
     except ImportError as e:
-        raise ImportError("mcp not installed. Run: pip install mcp") from e
+        raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
 
     G = _load_graph(graph_path)
     communities = _communities_from_graph(G)
@@ -630,7 +724,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         return "\n".join(lines)
 
     def _tool_god_nodes(arguments: dict) -> str:
-        from .analyze import god_nodes as _god_nodes
+        from graphify.analyze import god_nodes as _god_nodes
         nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
         lines = ["God nodes (most connected):"]
         lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]

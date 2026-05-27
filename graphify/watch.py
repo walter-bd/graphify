@@ -138,7 +138,7 @@ def _relativize_source_files(payload: dict, root: Path) -> None:
             if not source_path.is_absolute():
                 continue
             try:
-                item["source_file"] = str(source_path.resolve().relative_to(root))
+                item["source_file"] = source_path.resolve().relative_to(root).as_posix()
             except ValueError:
                 continue
 
@@ -240,12 +240,26 @@ def _topology_from_graph(G) -> dict:
     return data
 
 
-def _check_shrink(force: bool, existing_data: dict, new_data: dict, tmp: "Path | None" = None) -> bool:
+def _check_shrink(
+    force: bool,
+    existing_data: dict,
+    new_data: dict,
+    tmp: "Path | None" = None,
+    *,
+    had_explicit_deletions: bool = False,
+) -> bool:
     """Return True (ok to proceed) or False (shrink refused).
 
     When False, cleans up *tmp* if provided and prints a warning to stderr.
+
+    The shrink-guard exists to catch SILENT shrinkage from failed extraction
+    chunks (a half-written semantic pass leaving thousands of nodes
+    unaccounted for). When ``had_explicit_deletions`` is True, the caller
+    has declared which files were removed (e.g. the post-commit hook saw
+    a ``D`` in ``git diff --name-only``) and a smaller graph is the expected
+    outcome — skip the guard so legitimate refactors don't require ``--force``.
     """
-    if force or not existing_data:
+    if force or not existing_data or had_explicit_deletions:
         return True
     existing_n = len(existing_data.get("nodes", []))
     new_n = len(new_data.get("nodes", []))
@@ -326,11 +340,12 @@ def _rebuild_code(
     try:
         from graphify.extract import extract, _get_extractor
         from graphify.detect import detect
-        from graphify.build import build_from_json
+        from graphify.build import build_from_json, _norm_source_file as _nsf
         from graphify.cluster import cluster, remap_communities_to_previous, score_all
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
         from graphify.export import to_json, to_html
+        from graphify.security import check_graph_file_size_cap
 
         detected = detect(watch_path, follow_symlinks=follow_symlinks)
         code_files = [Path(f) for f in detected['files']['code']]
@@ -360,10 +375,7 @@ def _rebuild_code(
                     # File was deleted, renamed away, or filtered out by detect
                     # (e.g. .gitignore, vendored). Either way, evict any
                     # preserved nodes that still claim this source path.
-                    try:
-                        deleted_paths.add(str(cand.relative_to(project_root)))
-                    except ValueError:
-                        deleted_paths.add(str(cand))
+                    deleted_paths.add(_nsf(str(cand), str(project_root)) or str(cand))
             if not wanted and not deleted_paths:
                 print("[graphify watch] No tracked code files in change set - skipping rebuild.")
                 return True
@@ -389,16 +401,35 @@ def _rebuild_code(
         existing_graph_data: dict = {}
         if existing_graph.exists():
             try:
+                check_graph_file_size_cap(existing_graph)
                 existing = json.loads(existing_graph.read_text(encoding="utf-8"))
                 existing_graph_data = existing
                 new_ast_ids = {n["id"] for n in result["nodes"]}
+                _relativize_source_files(existing, project_root)
                 evict_sources: set[str] = set(deleted_paths)
                 if changed_paths is not None:
                     for p in extract_targets:
-                        try:
-                            evict_sources.add(str(p.relative_to(project_root)))
-                        except ValueError:
-                            evict_sources.add(str(p))
+                        evict_sources.add(_nsf(str(p), str(project_root)) or str(p))
+                else:
+                    # Full re-extraction: reconcile against current code files to
+                    # evict nodes from files deleted since the last run (#1007).
+                    _root_str = str(project_root)
+                    current_sources = {
+                        _nsf(str(p.relative_to(project_root)), _root_str)
+                        for p in code_files
+                        if p.is_relative_to(project_root)
+                    }
+                    for n in existing.get("nodes", []):
+                        sf = n.get("source_file")
+                        if not sf:
+                            continue
+                        if Path(sf).suffix.lower() not in _CODE_EXTENSIONS:
+                            continue
+                        norm = _nsf(sf, _root_str)
+                        if norm not in current_sources:
+                            evict_sources.add(sf)
+                            evict_sources.add(norm)
+                            deleted_paths.add(norm)
                 preserved_nodes = [
                     n for n in existing.get("nodes", [])
                     if n["id"] not in new_ast_ids
@@ -433,6 +464,7 @@ def _rebuild_code(
             same_graph = False
             if existing_graph.exists():
                 try:
+                    check_graph_file_size_cap(existing_graph)
                     existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
                     same_graph = (
                         json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
@@ -441,7 +473,10 @@ def _rebuild_code(
                 except Exception:
                     same_graph = False
             if not same_graph:
-                if not _check_shrink(force, existing_graph_data, candidate_graph_data):
+                if not _check_shrink(
+                    force, existing_graph_data, candidate_graph_data,
+                    had_explicit_deletions=bool(deleted_paths),
+                ):
                     return False
                 existing_graph.write_text(candidate_graph_text, encoding="utf-8")
 
@@ -526,6 +561,7 @@ def _rebuild_code(
         same_report = False
         if existing_graph.exists():
             try:
+                check_graph_file_size_cap(existing_graph)
                 existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
                 same_graph = (
                     json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
@@ -541,7 +577,11 @@ def _rebuild_code(
             graph_tmp.unlink(missing_ok=True)
             print("[graphify watch] No code-graph changes detected; graph.json/GRAPH_REPORT.md left untouched.")
         else:
-            if not _check_shrink(force, existing_graph_data, candidate_graph_data, tmp=graph_tmp):
+            if not _check_shrink(
+                force, existing_graph_data, candidate_graph_data,
+                tmp=graph_tmp,
+                had_explicit_deletions=bool(deleted_paths),
+            ):
                 return False
             from graphify.export import backup_if_protected as _backup
             _backup(out)

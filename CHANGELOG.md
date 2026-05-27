@@ -2,6 +2,69 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.8.21 (2026-05-27)
+
+- Fix: `graphify update` (no `--changed` flag) no longer leaves ghost nodes from files deleted between runs — full re-extraction path now reconciles the existing graph against current disk state and evicts any node whose `source_file` no longer exists; `_norm_source_file` used on both sides to guarantee path format consistency (#1007)
+- Fix: `graphify install --platform opencode --project` now writes `SKILL.md` to `.opencode/skills/graphify/SKILL.md` (discoverable by OpenCode) instead of the incorrect `.config/opencode/skills/` path; git-add hint updated accordingly (#1040)
+- Fix: post-commit hook no longer triggers rebuild when only `graphify-out/` files were committed (avoids infinite dirty-tree loop when graph outputs are tracked in git); `GRAPHIFY_SKIP_HOOK=1` env var added for one-off skip; hook rebuild log now appends (`>>`) instead of overwriting (`>`) (#1018, #1037)
+- Fix: graph output is now byte-for-byte deterministic across runs — edges sorted by `(source, target, relation)` in `build_from_json`; `PYTHONHASHSEED=0` exported in hook scripts to stabilize Louvain community ordering (#1010)
+- Feat: Amp (ampcode.com) platform support — `graphify amp install/uninstall` installs the skill into `.amp/skills/graphify/SKILL.md` (#948)
+- Fix: query punctuation no longer breaks node matching — `"what calls extract?"` correctly finds the `extract` node; `_search_tokens` helper strips punctuation from search terms in `_query_terms`, `_score_nodes`, and `_find_node` (#994, #978)
+- Fix: language built-in globals (`String`, `Number`, `Boolean`, `Object`, `Array`, etc.) no longer accumulate spurious call edges — filtered at same-file and cross-file resolution in the AST extractor, eliminating god-node pollution from constructor-style calls (#916, #726)
+- Feat: SystemVerilog header files (`.svh`) now extracted using the Verilog parser alongside `.v` and `.sv` (#1042)
+
+## 0.8.20 (2026-05-26)
+
+- Fix: stale nodes persist after `graphify update` when files are deleted on Windows — `deleted_paths` and `evict_sources` in `_rebuild_code` now use `.as_posix()` for consistent forward-slash paths; `_relativize_source_files` called on the existing graph before eviction (not after); `_relativize_source_files` itself now produces forward slashes (#1007)
+- Fix: `graphify extract` stale-node pruning now also handles symlinked scan roots — `prune_set` expansion uses `Path(root).resolve()` before `relative_to()` so symlinked roots produce correct relative paths (#1007)
+- Feat: MCP config extractor — `.mcp.json`, `mcp.json`, `mcp_servers.json`, `claude_desktop_config.json` now extracted into the knowledge graph; captures server nodes, npm/pip package refs, env var requirements; env values discarded to prevent secret leakage (#1034)
+- Fix: `cluster-only` no longer drops community label alignment after re-clustering — `remap_communities_to_previous` now applied in the `cluster-only` path, matching the behaviour of `graphify update` (#1028)
+- Fix: Dart child node IDs no longer embed absolute paths — switched from `_make_id(str(path), name)` to `_make_id(_file_stem(path), name)`, consistent with all other extractors; existing Dart graphs should be rebuilt with `--force` (#999)
+- Security: XML parsing in `extract_csproj` and `extract_lazarus_package` now pre-screens for `<!DOCTYPE` / `<!ENTITY` declarations before calling `ET.fromstring`, blocking billion-laughs DoS on malicious project files; `extract_lpk` also gains the missing 2 MiB size cap
+
+## 0.8.19 (2026-05-26)
+
+- Feat: .NET project file support — `.sln`, `.csproj`, `.fsproj`, `.vbproj`, `.razor`, `.cshtml` now extracted; captures NuGet package refs, project-to-project dependencies, target frameworks, SDK attributes, Blazor/Razor directives (`@using`, `@inject`, `@inherits`, `@model`, `@page`), component refs, and `@code` block methods (#1025)
+- Feat: Chinese query segmentation — compound Chinese tokens (e.g. `页面路由`) are split into meaningful words using jieba when installed, with character bigram fallback; original compound preserved alongside segments for exact-match; new `pip install "graphifyy[chinese]"` extra (#1026)
+- Fix: Wiki TypeError when `source_file` is `None` — `G.nodes[n].get("source_file") or ""` replaces `.get("source_file", "")`, which did not handle explicit `None` values (#1016)
+- Fix: Nested `.claude/worktrees/` no longer indexed — `_is_noise_dir` now accepts an optional `parent` param and skips `worktrees/` directories nested inside dotted dirs like `.claude/` (#1023)
+- Fix: `backup_if_protected` no longer accumulates one folder per run — uses content-hash comparison to skip identical backups and overwrite in-place when content changes; one folder per day maximum
+- Feat: Devin CLI support — `graphify devin install/uninstall` installs the skill into Devin's `.devin/rules/` directory (#1020)
+- Fix: TypeScript 5.0 array-form `extends` in `tsconfig.json` now handled — `_read_tsconfig_aliases` normalizes `extends` to a list before iteration (#1017)
+
+## 0.8.18 (2026-05-24)
+
+- Fix: post-commit hook now updates graph after delete-only commits — shrink-guard is bypassed when `changed_paths` contains explicit deletions, preventing stale nodes from accumulating indefinitely (#1000)
+- Fix: `graphify export` (html/obsidian/wiki/svg/graphml/neo4j) no longer collapses to "Single community" when `.graphify_analysis.json` is absent — falls back to per-node `community` attribute already present in `graph.json` (#1001)
+- Fix: Ukrainian README translation updated to v8 — all new sections, correct badges, 31 languages (#995)
+- Feat: semantic context tags on `references` edges for Python/JS/TS/C#/Java — `parameter_type`, `return_type`, `generic_arg`, `attribute`, `field`; C#/Java split `inherits`/`implements`; dedup key now includes context (#996)
+  - **Breaking:** Java `extends` edges are now emitted as `inherits` — queries filtering on `relation="extends"` for Java nodes must be updated to `relation="inherits"`
+- Feat: constrained query expansion in skill — Step 0 extracts actual graph vocab and forces LLM to pick expansion tokens only from that set, preventing hallucinated expansions; Unicode regex fix captures Cyrillic/CJK labels (#998)
+- Docs: Ukrainian README updated to v8 with all new sections, correct badges, YC badge, 31 language count (#995)
+
+## 0.8.17 (2026-05-23)
+
+- Fix: Case-sensitive call resolution for Go, Rust, and Elixir — resolvers previously lowercased both the label index and the callee name, causing `Authorize` to match `authorize` and produce phantom edges; Ruby/C#/Java/Kotlin/Scala/PHP use the same generic resolver which now splits into case-sensitive (all languages) and case-insensitive (PHP only, where function/class names are genuinely case-insensitive) dicts (#993)
+- Fix: Cross-language phantom `calls` edges from semantic extraction dropped at graph-build time — INFERRED `calls` edges whose source and target nodes belong to different language families (py/js/go/rs/jvm/c/cpp/rb/php/cs/swift/lua) are now discarded; skill.md prompt updated with an explicit anti-rule (#991)
+
+## 0.8.16 (2026-05-22)
+
+- Fix: CJK/Unicode labels no longer silently stripped during dedup — `_norm()` and `_norm_label()` now use Unicode-aware `[\W_]+` regex with `casefold()` and NFKC normalization; previously `道具処理クラス` and any non-ASCII label collapsed to empty string and got falsely merged (#937)
+- Fix: `.ets` (ArkTS/HarmonyOS) files now recognized as code and extracted via the TypeScript parser (#926)
+- Fix: `graphify` now exits non-zero when all semantic-extraction chunks fail — previously a silent empty graph was written with exit code 0, masking backend failures (#889)
+- Feat: `graphify install --project` installs the skill into the current repository (`.claude/skills/`, `.agents/skills/`, etc.) instead of the user home directory; per-platform subcommands support the same flag (#931)
+- Docs: Uzbek (uz-UZ) README translation (#982)
+
+## 0.8.15 (2026-05-22)
+
+- Fix: `cluster-only` subcommand crashed with `FileNotFoundError` when `graphify-out/` did not yet exist — output directory is now created before any write (#934)
+- Fix: `GRAPHIFY_MAX_OUTPUT_TOKENS` env var now respected for all OpenAI-compatible backends — previously the token limit was hardcoded, causing truncated responses on high-context queries (#973)
+- Fix: Swift extension nodes no longer duplicated across files — `_merge_swift_extensions` deduplicates by canonical name before graph insertion (#969)
+- Fix: Non-Latin query terms (CJK, Arabic, Cyrillic, etc.) now preserved through query preprocessing — previous normalization stripped non-ASCII chars, making multi-lingual codebases unsearchable (#964)
+- Feat: Multigraph runtime compatibility probe — emits a warning if a `MultiDiGraph` is passed where a `Graph` is expected by any downstream consumer (analyze, cluster, wiki, export, report) (#956)
+- Feat: JS/TS barrel re-exports tracked as explicit `re_exports` graph edges — `export { X } from './mod'` emits typed edges with `context="re-export"` and `confidence=EXTRACTED`; file-level `imports_from` edges also emitted (#960)
+- Feat: `--affected` and `--import-resolution` flags for the `v8` subcommand — impact analysis and cross-file import resolution exposed as first-class CLI options
+
 ## 0.8.14 (2026-05-20)
 
 - Fix: `--wiki` crash when community node IDs are stale after dedup or re-extract — stale IDs are now silently dropped with a stderr warning; raises a clear error only if every ID is stale (#936)

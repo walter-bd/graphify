@@ -1,5 +1,6 @@
 # write graph to HTML, JSON, SVG, GraphML, Obsidian vault, and Neo4j Cypher
 from __future__ import annotations
+import hashlib
 import html as _html
 import json
 import math
@@ -62,10 +63,16 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     reason = "+".join(filter(None, ["semantic" if is_semantic else "", "curated" if is_curated else ""]))
     today = date.today().isoformat()
     backup_dir = out / today
-    suffix = 2
-    while backup_dir.exists():
-        backup_dir = out / f"{today}_{suffix}"
-        suffix += 1
+    graph_src = out / "graph.json"
+
+    # Skip re-copying if today's backup already has identical graph.json content.
+    # If content differs (graph changed since the last backup today), overwrite
+    # the backup in place — one folder per day, always the latest pre-overwrite state.
+    if backup_dir.exists() and (backup_dir / "graph.json").exists():
+        src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
+        bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
+        if src_hash == bak_hash:
+            return backup_dir  # identical content, nothing to do
 
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -477,6 +484,8 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     existing_path = Path(output_path)
     if not force and existing_path.exists():
         try:
+            from graphify.security import check_graph_file_size_cap
+            check_graph_file_size_cap(existing_path)
             existing_data = json.loads(existing_path.read_text(encoding="utf-8"))
             existing_n = len(existing_data.get("nodes", []))
             new_n = G.number_of_nodes()
@@ -744,7 +753,9 @@ def to_html(
 <head>
 <meta charset="UTF-8">
 <title>graphify - {title}</title>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"
+        integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"
+        crossorigin="anonymous"></script>
 {_html_styles()}
 </head>
 <body>

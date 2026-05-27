@@ -1,4 +1,4 @@
-"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS."""
+"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS, .NET project files."""
 from __future__ import annotations
 from pathlib import Path
 import pytest
@@ -6,7 +6,7 @@ from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
     extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
-    extract_groovy,
+    extract_groovy, extract_sln, extract_csproj, extract_razor,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -40,6 +40,29 @@ def _references(r):
 
 def _edges_with_relation(r, *relations):
     return [e for e in r["edges"] if e["relation"] in relations]
+
+
+def _normalize_symbol_label(label: str) -> str:
+    return label.strip("()").lstrip(".")
+
+
+def _node_by_label(result: dict, label: str) -> dict:
+    for node in result["nodes"]:
+        if node.get("label") == label or _normalize_symbol_label(node.get("label", "")) == label:
+            return node
+    raise AssertionError(f"missing node label {label!r}")
+
+
+def _edge_labels(result: dict, relation: str, context: str | None = None) -> set[tuple[str, str]]:
+    labels = {node["id"]: _normalize_symbol_label(node["label"]) for node in result["nodes"]}
+    pairs = set()
+    for edge in result["edges"]:
+        if edge.get("relation") != relation:
+            continue
+        if context is not None and edge.get("context") != context:
+            continue
+        pairs.add((labels.get(edge["source"], edge["source"]), labels.get(edge["target"], edge["target"])))
+    return pairs
 
 
 # ── Java ──────────────────────────────────────────────────────────────────────
@@ -222,15 +245,42 @@ def test_csharp_inherits_edge():
     inherits = [e for e in r["edges"] if e["relation"] == "inherits"]
     assert len(inherits) >= 1
 
-def test_csharp_inherits_iprocessor():
+def test_csharp_implements_iprocessor():
     r = extract_csharp(FIXTURES / "sample.cs")
     node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
     found = any(
         "DataProcessor" in node_by_id.get(e["source"], "") and
         "IProcessor" in node_by_id.get(e["target"], "")
-        for e in r["edges"] if e["relation"] == "inherits"
+        for e in r["edges"] if e["relation"] == "implements"
     )
-    assert found, "DataProcessor should have inherits edge to IProcessor"
+    assert found, "DataProcessor should have implements edge to IProcessor"
+
+
+def test_csharp_splits_inherits_and_implements_edges():
+    result = extract_csharp(FIXTURES / "sample.cs")
+    assert ("DataProcessor", "Processor") in _edge_labels(result, "inherits")
+    assert ("DataProcessor", "IProcessor") in _edge_labels(result, "implements")
+
+
+def test_csharp_parameter_return_and_generic_contexts():
+    result = extract_csharp(FIXTURES / "sample.cs")
+    assert ("Build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
+    assert ("Build", "Result") in _edge_labels(result, "references", "return_type")
+    assert ("Build", "DataProcessor") in _edge_labels(result, "references", "generic_arg")
+
+
+def test_java_normalizes_inherits_and_implements():
+    result = extract_java(FIXTURES / "sample.java")
+    assert ("DataProcessor", "BaseProcessor") in _edge_labels(result, "inherits")
+    assert ("DataProcessor", "Processor") in _edge_labels(result, "implements")
+
+
+def test_java_parameter_return_generic_and_attribute_contexts():
+    result = extract_java(FIXTURES / "sample.java")
+    assert ("build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
+    assert ("build", "Result") in _edge_labels(result, "references", "return_type")
+    assert ("build", "DataProcessor") in _edge_labels(result, "references", "generic_arg")
+    assert ("build", "Override") in _edge_labels(result, "references", "attribute")
 
 
 def test_csharp_field_type_references_have_field_context():
@@ -553,6 +603,26 @@ def test_swift_call_edges_have_call_context():
     call_edges = _edges_with_relation(r, "calls")
     assert call_edges
     assert all(e.get("context") == "call" for e in call_edges)
+
+
+def test_swift_extension_across_files_merges_into_canonical_type():
+    """`extension Foo` in a separate file from `class Foo` must resolve to a
+    single Foo node. tree-sitter-swift parses both as `class_declaration` and
+    node ids carry the file stem, so without a corpus-level merge each file
+    would emit its own Foo."""
+    from graphify.extract import extract
+    paths = sorted((FIXTURES / "swift_cross_file").glob("*.swift"))
+    r = extract(paths, cache_root=Path("/tmp/graphify-test-no-cache"))
+    foo_nodes = [n for n in r["nodes"] if n["label"] == "Foo"]
+    assert len(foo_nodes) == 1, f"Foo should appear once, got {len(foo_nodes)}: {[n['id'] for n in foo_nodes]}"
+    foo_id = foo_nodes[0]["id"]
+    method_targets = {
+        e["target"] for e in r["edges"]
+        if e["relation"] == "method" and e["source"] == foo_id
+    }
+    method_labels = {n["label"] for n in r["nodes"] if n["id"] in method_targets}
+    assert any("one" in l for l in method_labels), f"one() should attach to Foo, got {method_labels}"
+    assert any("two" in l for l in method_labels), f"extension method two() should attach to Foo, got {method_labels}"
 
 
 # ── Elixir ────────────────────────────────────────────────────────────────────
@@ -985,6 +1055,78 @@ def test_groovy_spock_preserves_import_edges():
 
 def test_groovy_spock_no_dangling_edges():
     r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids
+
+
+# -- .NET project files (.sln, .csproj, .razor) -------------------------------
+
+def test_sln_no_error():
+    r = extract_sln(FIXTURES / "sample.sln")
+    assert "error" not in r
+
+def test_sln_finds_projects():
+    r = extract_sln(FIXTURES / "sample.sln")
+    labels = _labels(r)
+    assert any("WebApi" in l for l in labels)
+    assert any("Domain" in l for l in labels)
+
+def test_sln_contains_edges():
+    r = extract_sln(FIXTURES / "sample.sln")
+    assert "contains" in _relations(r)
+
+def test_sln_project_dependency_edges():
+    r = extract_sln(FIXTURES / "sample.sln")
+    assert "imports" in _relations(r)
+
+def test_csproj_no_error():
+    r = extract_csproj(FIXTURES / "sample.csproj")
+    assert "error" not in r
+
+def test_csproj_finds_packages():
+    r = extract_csproj(FIXTURES / "sample.csproj")
+    labels = _labels(r)
+    assert any("MediatR" in l for l in labels)
+    assert any("FluentValidation" in l for l in labels)
+
+def test_csproj_finds_project_references():
+    r = extract_csproj(FIXTURES / "sample.csproj")
+    labels = _labels(r)
+    assert any("Domain.csproj" in l for l in labels)
+
+def test_csproj_finds_target_framework():
+    r = extract_csproj(FIXTURES / "sample.csproj")
+    assert any("net8.0" in l for l in _labels(r))
+
+def test_csproj_finds_sdk():
+    r = extract_csproj(FIXTURES / "sample.csproj")
+    assert any("Microsoft.NET.Sdk.Web" in l for l in _labels(r))
+
+def test_razor_no_error():
+    r = extract_razor(FIXTURES / "sample.razor")
+    assert "error" not in r
+
+def test_razor_finds_using_directives():
+    r = extract_razor(FIXTURES / "sample.razor")
+    assert "imports" in _relations(r)
+
+def test_razor_finds_component_references():
+    r = extract_razor(FIXTURES / "sample.razor")
+    assert "calls" in _relations(r)
+
+def test_razor_finds_inherits():
+    r = extract_razor(FIXTURES / "sample.razor")
+    assert "inherits" in _relations(r)
+
+def test_razor_finds_code_block_methods():
+    r = extract_razor(FIXTURES / "sample.razor")
+    labels = _labels(r)
+    assert any("IncrementCount" in l for l in labels)
+    assert any("LoadData" in l for l in labels)
+
+def test_razor_no_dangling_edges():
+    r = extract_razor(FIXTURES / "sample.razor")
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids

@@ -160,7 +160,18 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # slightly different casing or punctuation than the AST extractor.
     # e.g. "Session_ValidateToken" maps to "session_validatetoken".
     norm_to_id: dict[str, str] = {_normalize_id(nid): nid for nid in node_set}
-    for edge in extraction.get("edges", []):
+    # Iterate edges in a deterministic order. The graph is undirected and stores
+    # direction in _src/_tgt; when two edges collapse onto the same node pair the
+    # last write wins, so an unstable iteration order flips _src/_tgt run-to-run
+    # and makes the serialized graph churn. Sorting fixes the last-write outcome.
+    for edge in sorted(
+        extraction.get("edges", []),
+        key=lambda e: (
+            str(e.get("source", e.get("from", ""))),
+            str(e.get("target", e.get("to", ""))),
+            str(e.get("relation", "")),
+        ),
+    ):
         if "source" not in edge and "from" in edge:
             edge["source"] = edge["from"]
         if "target" not in edge and "to" in edge:
@@ -178,6 +189,23 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         attrs = {k: v for k, v in edge.items() if k not in ("source", "target")}
         if "source_file" in attrs:
             attrs["source_file"] = _norm_source_file(attrs["source_file"], _root)
+        # Drop cross-language INFERRED `calls` edges — same short names (render,
+        # parse, etc.) appear across language boundaries in multi-language chunks,
+        # producing phantom edges that don't represent real call relationships.
+        if attrs.get("relation") == "calls" and attrs.get("confidence") == "INFERRED":
+            _LANG_FAMILY: dict[str, str] = {
+                ".py": "py", ".pyi": "py",
+                ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js",
+                ".ts": "js", ".tsx": "js",
+                ".go": "go", ".rs": "rs",
+                ".java": "jvm", ".kt": "jvm", ".scala": "jvm", ".groovy": "jvm",
+                ".c": "c", ".h": "c", ".cc": "cpp", ".cpp": "cpp", ".hpp": "cpp",
+                ".rb": "rb", ".php": "php", ".cs": "cs", ".swift": "swift", ".lua": "lua",
+            }
+            src_ext = Path(G.nodes[src].get("source_file") or "").suffix.lower()
+            tgt_ext = Path(G.nodes[tgt].get("source_file") or "").suffix.lower()
+            if src_ext and tgt_ext and _LANG_FAMILY.get(src_ext) != _LANG_FAMILY.get(tgt_ext):
+                continue
         # Preserve original edge direction - undirected graphs lose it otherwise,
         # causing display functions to show edges backwards.
         attrs["_src"] = src
@@ -228,8 +256,9 @@ def build(
 
 
 def _norm_label(label: str) -> str:
-    """Canonical dedup key — lowercase, alphanumeric only."""
-    return re.sub(r"[^a-z0-9 ]", "", label.lower()).strip()
+    """Canonical dedup key — Unicode-aware, preserves CJK/word characters."""
+    label = unicodedata.normalize("NFKC", label)
+    return re.sub(r"[\W_ ]+", " ", label.casefold(), flags=re.UNICODE).strip()
 
 
 def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -303,6 +332,8 @@ def build_merge(
         # was inserted before the caller. The _src/_tgt direction-preserving
         # attrs are popped before saving in export.py, so going through the
         # NetworkX round-trip loses direction permanently (#760).
+        from graphify.security import check_graph_file_size_cap
+        check_graph_file_size_cap(graph_path)
         data = json.loads(graph_path.read_text(encoding="utf-8"))
         links_key = "links" if "links" in data else "edges"
         existing_nodes = list(data.get("nodes", []))
@@ -317,7 +348,21 @@ def build_merge(
 
     # Prune nodes and edges from deleted source files
     if prune_sources:
-        prune_set = set(prune_sources)
+        # Build a set containing both the raw form (matches nodes that kept
+        # absolute source_file) and the normalised relative form (matches nodes
+        # that were relativised by _norm_source_file at build time).
+        # .resolve() handles symlinked roots and redundant ".." / "./" segments
+        # so Path.relative_to() succeeds even when the scan root is a symlink.
+        # (#1007: manifest absolute paths vs graph relative source_file mismatch)
+        _root_str = str(Path(root).resolve()) if root is not None else None
+        prune_set: set[str] = set()
+        for p in prune_sources:
+            if not p:
+                continue
+            prune_set.add(p)
+            norm = _norm_source_file(p, _root_str)
+            if norm:
+                prune_set.add(norm)
         to_remove = [
             n for n, d in G.nodes(data=True)
             if d.get("source_file") in prune_set
