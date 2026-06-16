@@ -26,6 +26,8 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify <path> --graphml                            # export graph.graphml (Gephi, yEd)
 /graphify <path> --neo4j                              # generate graphify-out/cypher.txt for Neo4j
 /graphify <path> --neo4j-push bolt://localhost:7687   # push directly to Neo4j
+/graphify <path> --falkordb                           # generate graphify-out/cypher.txt for FalkorDB
+/graphify <path> --falkordb-push falkordb://localhost:6379   # push directly to FalkorDB
 /graphify <path> --mcp                                # start MCP stdio server for agent access
 /graphify <path> --watch                              # watch folder, auto-rebuild on code changes (no LLM needed)
 /graphify <path> --wiki                               # build agent-crawlable wiki (index.md + one article per community)
@@ -477,9 +479,9 @@ graphify export html  # auto-aggregates to community view if graph > 5000 nodes
 # or: graphify export html --no-viz
 ```
 
-### Steps 6b-8 - Wiki, Neo4j, SVG, GraphML, MCP, benchmark (only on their flags)
+### Steps 6b-8 - Wiki, Neo4j, FalkorDB, SVG, GraphML, MCP, benchmark (only on their flags)
 
-These run only when their flag is present (`--wiki`, `--neo4j`/`--neo4j-push`, `--svg`, `--graphml`, `--mcp`) or, for the token-reduction benchmark, when `total_words` exceeds 5,000. A default run with no export flags skips all of them. See `references/exports.md` for each one. Run any `--wiki` export before Step 9 cleanup so `.graphify_labels.json` is still available.
+These run only when their flag is present (`--wiki`, `--neo4j`/`--neo4j-push`, `--falkordb`/`--falkordb-push`, `--svg`, `--graphml`, `--mcp`) or, for the token-reduction benchmark, when `total_words` exceeds 5,000. A default run with no export flags skips all of them. See `references/exports.md` for each one. Run any `--wiki` export before Step 9 cleanup so `.graphify_labels.json` is still available.
 
 ---
 
@@ -584,13 +586,13 @@ Both are non-default subcommands. `--update` re-extracts only new or changed fil
 
 ## For /graphify query
 
-When `graphify-out/graph.json` already exists and the user asks a question about the corpus, run the query directly:
+When `graphify-out/graph.json` already exists and the user asks a question about the corpus, answer from the graph rather than rebuilding it:
 
 ```bash
 graphify query "<question>"
 ```
 
-Answer using only what the graph output contains, and quote `source_location` when citing a specific fact. Before traversal, expand the question against the graph's own vocabulary so a wording mismatch does not collapse the answer to noise. For that vocab-expansion step, the `--dfs` / `--budget` modes, `save-result` feedback, and the `/graphify path` and `/graphify explain` flows, see `references/query.md`.
+Before traversal, expand the question against the graph's own vocabulary so a wording mismatch does not collapse the answer to noise. If the `graphify query` CLI is unavailable, fall back to an inline NetworkX traversal of `graphify-out/graph.json`. Answer using only what the graph output contains, and quote `source_location` when citing a specific fact. For that vocab-expansion step, the BFS/DFS traversal modes, the `--budget` cap, the NetworkX fallback, `save-result` feedback, and the `/graphify path` and `/graphify explain` flows, see `references/query.md`.
 
 ---
 
