@@ -23,12 +23,12 @@ _BUILTIN_NOISE_LABELS = frozenset({
 # Language families — extensions sharing a runtime can legitimately call each other
 _LANG_FAMILY: dict[str, str] = {
     **{e: "python" for e in (".py", ".pyw")},
-    **{e: "js" for e in (".js", ".jsx", ".mjs", ".ejs", ".ts", ".tsx", ".vue", ".svelte")},
+    **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".ejs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte")},
     **{e: "go" for e in (".go",)},
     **{e: "rust" for e in (".rs",)},
     **{e: "jvm" for e in (".java", ".kt", ".kts", ".scala")},
     **{e: "c" for e in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
-    **{e: "ruby" for e in (".rb",)},
+    **{e: "ruby" for e in (".rb", ".rake")},
     **{e: "swift" for e in (".swift",)},
     **{e: "dotnet" for e in (".cs",)},
     **{e: "php" for e in (".php",)},
@@ -64,11 +64,12 @@ def _is_file_node(G: nx.Graph, node_id: str) -> bool:
     label = attrs.get("label", "")
     if not label:
         return False
-    # File-level hub: label matches the actual source filename (not just any label ending in .py)
+    # File-level hub: label matches the actual source filename — bare basename OR
+    # the directory-qualified form the #2032 disambiguation pass may assign.
     source_file = attrs.get("source_file", "")
     if source_file:
-        from pathlib import Path as _Path
-        if label == _Path(source_file).name:
+        from graphify.build import _is_file_node_label
+        if _is_file_node_label(label, source_file):
             return True
     # Method stub: AST extractor labels methods as '.method_name()'
     if label.startswith(".") and label.endswith("()"):
@@ -504,7 +505,10 @@ def suggest_questions(
     # 4. Isolated or weakly-connected nodes → exploration questions
     isolated = [
         n for n in G.nodes()
-        if G.degree(n) <= 1 and not _is_file_node(G, n) and not _is_concept_node(G, n)
+        if G.degree(n) <= 1
+        and not _is_file_node(G, n)
+        and not _is_concept_node(G, n)
+        and G.nodes[n].get("file_type") != "rationale"
     ]
     if isolated:
         labels = [G.nodes[n].get("label", n) for n in isolated[:3]]
@@ -661,6 +665,11 @@ def find_import_cycles(
     for u, v, data in G.edges(data=True):
         rel = data.get("relation", "")
         if rel not in ("imports_from", "re_exports"):
+            continue
+
+        # Deferred `import(...)` edges are real dependencies but do not form a
+        # hard file-level cycle, so they are excluded from cycle detection (#1241).
+        if data.get("deferred"):
             continue
 
         src_file_attr = data.get("source_file", "")
