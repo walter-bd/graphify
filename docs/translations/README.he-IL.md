@@ -472,7 +472,7 @@ python3 -m venv .venv && .venv/bin/pip install "graphifyy[mcp]"
 | `GEMINI_API_KEY` או `GOOGLE_API_KEY` | ‏backend של Google Gemini | `--backend gemini` |
 | `OPENAI_API_KEY` | ‏OpenAI או ממשקים תואמי-OpenAI | `--backend openai` (שרתים מקומיים מקבלים כל ערך לא ריק) |
 | `OPENAI_BASE_URL` | כתובת שרת תואם-OpenAI ‏(llama.cpp, ‏vLLM, ‏LM Studio, ...) | `--backend openai` (ברירת מחדל: `https://api.openai.com/v1`) |
-| `OPENAI_MODEL` | שם המודל ל-backend של OpenAI — לשרתים בהרצה עצמית, השתמשו בשם/כינוי שהשרת חושף (בדקו את endpoint ה-`/v1/models` שלו) | `--backend openai` (ברירת מחדל: `gpt-4.1-mini`) |
+| `OPENAI_MODEL` | שם המודל ל-backend של OpenAI — לשרתים בהרצה עצמית, השתמשו בשם/כינוי שהשרת חושף (בדקו את endpoint ה-`/v1/models` שלו) | `--backend openai` (ברירת מחדל: `gpt-5.6-luna`) |
 | `DEEPSEEK_API_KEY` | ‏backend של DeepSeek | `--backend deepseek` |
 | `MOONSHOT_API_KEY` | ‏backend של Kimi Code | `--backend kimi` |
 | `OLLAMA_BASE_URL` | כתובת הרצה מקומית של Ollama | `--backend ollama` (ברירת מחדל: `http://localhost:11434`) |

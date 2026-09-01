@@ -159,7 +159,7 @@ def test_openai_service_tier_can_be_overridden_by_env(monkeypatch):
 
     class _FakeResponse:
         def __init__(self):
-            self.choices = [type("Choice", (), {"message": type("Msg", (), {"content": '{"nodes":[],"edges":[],"hyperedges":[]}'})(), "finish_reason": "stop"})()]
+            self.choices = [type("Choice", (), {"message": type("Msg", (), {"content": '{"nodes":[{"id":"x"}],"edges":[],"hyperedges":[]}'})(), "finish_reason": "stop"})()]
             self.usage = type("Usage", (), {"prompt_tokens": 1, "completion_tokens": 1})()
 
     class _FakeCompletions:
@@ -194,9 +194,9 @@ def test_openai_service_tier_can_be_overridden_by_env(monkeypatch):
     assert llm._service_tier_for_backend("openai") == "flex"
 
 
-def test_openai_default_model_is_gpt_5_mini(monkeypatch):
+def test_openai_default_model_is_gpt_5_6_luna(monkeypatch):
     _clear_backend_env(monkeypatch)
-    assert llm._default_model_for_backend("openai") == "gpt-5-mini"
+    assert llm._default_model_for_backend("openai") == "gpt-5.6-luna"
 
 
 def test_missing_gemini_key_names_both_supported_env_vars(monkeypatch):
@@ -1113,7 +1113,7 @@ def test_openai_compat_omits_temperature_for_o3_model(tmp_path, monkeypatch):
 def test_openai_compat_sends_temperature_for_normal_model(tmp_path, monkeypatch):
     _clear_backend_env(monkeypatch)
     monkeypatch.delenv("GRAPHIFY_LLM_TEMPERATURE", raising=False)
-    monkeypatch.delenv("GRAPHIFY_OPENAI_MODEL", raising=False)
+    monkeypatch.setenv("GRAPHIFY_OPENAI_MODEL", "gpt-4.1-mini")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     captured = _install_capturing_openai(monkeypatch)
     (tmp_path / "f.py").write_text("x = 1\n")

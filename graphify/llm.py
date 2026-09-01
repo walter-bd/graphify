@@ -152,7 +152,7 @@ BACKENDS: dict[str, dict] = {
         # model. GRAPHIFY_OPENAI_MODEL still wins over OPENAI_MODEL when both
         # are set (via model_env_key).
         "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "default_model": os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
+        "default_model": os.environ.get("OPENAI_MODEL", "gpt-5.6-luna"),
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "GRAPHIFY_OPENAI_MODEL",
         "service_tier_env_key": "GRAPHIFY_OPENAI_SERVICE_TIER",
@@ -160,7 +160,7 @@ BACKENDS: dict[str, dict] = {
         "pricing": {"input": 0.40, "output": 1.60},  # USD per 1M tokens
         # Default is omitted for reasoning-style models; GRAPHIFY_LLM_TEMPERATURE
         # can still force an explicit value when supported by target endpoint.
-        "temperature": None,
+        "temperature": 0,
         "reasoning_effort": "low",
         "vision": True,
     },
@@ -1337,7 +1337,7 @@ def _default_model_for_backend(backend: str) -> str:
 
 def _service_tier_for_backend(backend: str) -> str | None:
     """Return an optional service tier override for a backend."""
-    cfg = BACKENDS[backend]
+    cfg = BACKENDS.get(backend, {})
     tier_env_key = cfg.get("service_tier_env_key")
     if not tier_env_key:
         return None

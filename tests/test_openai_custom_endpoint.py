@@ -15,7 +15,7 @@ def test_openai_defaults_without_env(monkeypatch):
     reloaded = importlib.reload(llm)
     try:
         assert reloaded.BACKENDS["openai"]["base_url"] == "https://api.openai.com/v1"
-        assert reloaded.BACKENDS["openai"]["default_model"] == "gpt-4.1-mini"
+        assert reloaded.BACKENDS["openai"]["default_model"] == "gpt-5.6-luna"
     finally:
         monkeypatch.undo()
         importlib.reload(llm)
