@@ -1,7 +1,14 @@
 """Tests for graphify/dedup.py entity deduplication pipeline."""
 from __future__ import annotations
 import pytest
-from graphify.dedup import deduplicate_entities, _defines_id, _entropy, _shingles
+from graphify.dedup import (
+    deduplicate_entities,
+    _collision_rank,
+    _defines_id,
+    _entropy,
+    _lifecycle_penalty,
+    _shingles,
+)
 
 
 # ── entropy gate ─────────────────────────────────────────────────────────────
@@ -628,6 +635,108 @@ def test_defines_id_helper():
     assert not _defines_id({"id": "docs_intro_foo", "source_file": ""})
 
 
+# ── #2532: lifecycle-aware, environment-stable collision ranking ──────────────
+# Active-vs-archived path markers adapted from @michaelxer's PR #2540, judged on
+# root-relative segments with a reversed-segment final tiebreak so the survivor
+# cannot flip with path form or checkout location.
+
+_DONE_PLAN = {"id": "plans_binding_doctrine", "label": "binding doctrine",
+              "file_type": "concept",
+              "source_file": "plans/_done/binding-doctrine.md"}
+_ACTIVE_PLAN = {"id": "plans_binding_doctrine", "label": "binding doctrine",
+                "file_type": "concept",
+                "source_file": "plans/in-progress/binding-doctrine.md"}
+
+
+def test_lifecycle_penalty_on_relative_segments():
+    assert _lifecycle_penalty("plans/_done/x.md") == 2
+    assert _lifecycle_penalty("plans/in-progress/x.md") == 0
+    assert _lifecycle_penalty("docs/x.md") == 1
+    # A FILE named after a marker is not a marker — only directory segments count.
+    assert _lifecycle_penalty("done.md") == 1
+    assert _lifecycle_penalty("plans/done.md") == 1
+    # Mixed markers: the best (most active) marked segment wins.
+    assert _lifecycle_penalty("archive/in-progress/x.md") == 0
+
+
+def test_archived_path_ranks_below_active_despite_ascii_order():
+    """#2532: `plans/_done` sorts before `plans/in-progress` lexically ('_' < 'i'),
+    so a raw-string tiebreak picks the archived copy — assert the ASCII trap is
+    real, then that the rank inverts it."""
+    assert _DONE_PLAN["source_file"] < _ACTIVE_PLAN["source_file"]  # the trap
+    assert _collision_rank(_ACTIVE_PLAN) < _collision_rank(_DONE_PLAN)
+
+
+def test_active_plan_survives_archived_copy_order_independent():
+    """#2532 reported case: the in-progress copy survives, whichever order the
+    colliding nodes arrive in."""
+    import itertools
+    for perm in itertools.permutations([_DONE_PLAN, _ACTIVE_PLAN]):
+        out, _ = deduplicate_entities([dict(n) for n in perm], [], communities={})
+        assert len(out) == 1
+        assert out[0]["source_file"] == "plans/in-progress/binding-doctrine.md"
+
+
+def test_checkout_dir_lifecycle_name_does_not_mark_paths(tmp_path):
+    """Gap in #2540: markers must be matched on ROOT-RELATIVE segments only. An
+    absolute source_file stored under a checkout directory named `wip` must not
+    be scored active by the checkout location — the archived copy still loses."""
+    import itertools
+    root = tmp_path / "wip" / "repo"
+    archived = {"id": "plans_doc", "label": "doc", "file_type": "concept",
+                "source_file": str(root / "plans" / "_done" / "doc.md")}
+    active = {"id": "plans_doc", "label": "doc", "file_type": "concept",
+              "source_file": "plans/roadmap/doc.md"}
+    for perm in itertools.permutations([archived, active]):
+        out, _ = deduplicate_entities([dict(n) for n in perm], [],
+                                      communities={}, root=root)
+        assert len(out) == 1
+        assert out[0]["source_file"] == "plans/roadmap/doc.md"
+
+
+def test_neutral_collision_survivor_is_stable_across_path_forms(tmp_path):
+    """#2532: with no lifecycle markers, the tiebreak must not depend on whether
+    either path is stored absolute or repo-relative — one root-relative file
+    identity survives across all four form combinations and both insertion
+    orders (8 runs)."""
+    import itertools
+    root = tmp_path / "repo"
+    rel_a, rel_b = "plans/q3/doc.md", "plans/roadmap/doc.md"
+    survivors = set()
+    for form_a in (rel_a, str(root / rel_a)):
+        for form_b in (rel_b, str(root / rel_b)):
+            a = {"id": "plans_doc", "label": "doc", "file_type": "concept",
+                 "source_file": form_a}
+            b = {"id": "plans_doc", "label": "doc", "file_type": "concept",
+                 "source_file": form_b}
+            for perm in itertools.permutations([a, b]):
+                out, _ = deduplicate_entities([dict(n) for n in perm], [],
+                                              communities={}, root=root)
+                assert len(out) == 1
+                sf = out[0]["source_file"].replace("\\", "/")
+                prefix = str(root).replace("\\", "/") + "/"
+                survivors.add(sf.removeprefix(prefix))
+    assert survivors == {"plans/q3/doc.md"}, (
+        f"survivor depends on path form or order: {survivors}"
+    )
+
+
+def test_archived_definer_beats_active_reference():
+    """The definer flag outranks the lifecycle penalty: a node that owns its ID
+    survives even from an archived folder against a live cross-reference."""
+    import itertools
+    nid = "plans_done_spec_spec"
+    definer = {"id": nid, "label": "spec doc", "file_type": "concept",
+               "source_file": "plans/_done/spec.md"}
+    reference = {"id": nid, "label": "spec", "file_type": "concept",
+                 "source_file": "plans/in-progress/roadmap.md"}
+    assert _defines_id(definer) and not _defines_id(reference)
+    for perm in itertools.permutations([definer, reference]):
+        out, _ = deduplicate_entities([dict(n) for n in perm], [], communities={})
+        assert len(out) == 1
+        assert out[0]["source_file"] == "plans/_done/spec.md"
+
+
 # ── #2091 review: attribute-merge correctness (fixes A-D) ─────────────────────
 
 def test_dedup_gapfill_is_order_independent_with_multiple_losers():
@@ -692,3 +801,398 @@ def test_dedup_fills_explicit_none_attribute():
     result, _ = deduplicate_entities([dict(n) for n in nodes], [], communities={})
     assert len(result) == 1
     assert result[0].get("source_location") == "L7", "explicit-None must be filled from the loser"
+
+
+# ── #2182: cross-file exact-duplicate concepts must merge ─────────────────────
+
+def test_crossfile_identical_concepts_merge_and_rewire():
+    """Two `concept` nodes whose labels are byte-identical after _norm() but
+    live in different files must merge (#2182). Pass 1 used to defer them to
+    Pass 2, whose norm-unique candidate filter (`seen_norms`) structurally
+    cannot form an equal-norm pair — so exact cross-file duplicates were the
+    one class of duplicate that never merged, while a one-char-different
+    fuzzy pair did."""
+    nodes = [
+        {"id": "sz_intl", "label": "SHENZHEN INTERNATIONAL",
+         "file_type": "concept", "source_file": "doc1.md"},
+        {"id": "shenzhen_international_holdings", "label": "Shenzhen international",
+         "file_type": "concept", "source_file": "doc2.md"},
+        {"id": "port_ops", "label": "Port Operations",
+         "file_type": "concept", "source_file": "doc2.md"},
+    ]
+    edges = [{"source": "shenzhen_international_holdings", "target": "port_ops",
+              "relation": "operates"}]
+    result_nodes, result_edges = deduplicate_entities(nodes, edges, communities={})
+    ids = {n["id"] for n in result_nodes}
+    assert len(result_nodes) == 2
+    # _pick_winner prefers the shorter, non-chunk-suffixed id.
+    assert "sz_intl" in ids
+    assert "shenzhen_international_holdings" not in ids
+    # The loser's edge is rewired to the winner.
+    assert result_edges == [
+        {"source": "sz_intl", "target": "port_ops", "relation": "operates"}]
+
+
+def test_crossfile_one_char_typo_concepts_still_merge():
+    """Non-regression: the near-identical (one-char-different) cross-file pair
+    that already merged via Pass 2 fuzzy matching must keep merging (#2182)."""
+    nodes = [
+        {"id": "g1", "label": "Authentication Manager",
+         "file_type": "concept", "source_file": "a.md"},
+        {"id": "g2", "label": "Authentication Managr",
+         "file_type": "concept", "source_file": "b.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+_RATIONALE_BOILER = ("Django app config for apps.platform.cards. No business "
+                     "logic here. Domain services live in services.py.")
+
+
+@pytest.mark.parametrize("a,b", [
+    ({"id": "d1", "label": "Getting Started Installation Guide",
+      "file_type": "document", "source_file": "docs/a.md"},
+     {"id": "d2", "label": "Getting Started Installation Guide",
+      "file_type": "document", "source_file": "docs/b.md"}),
+    ({"id": "r1", "label": _RATIONALE_BOILER,
+      "file_type": "rationale", "source_file": "apps/platform/cards/apps.py"},
+     {"id": "r2", "label": _RATIONALE_BOILER,
+      "file_type": "rationale", "source_file": "apps/platform/cores/apps.py"}),
+    ({"id": "backend_a_render_frame", "label": "render_frame",
+      "file_type": "code", "source_file": "backend_a.py"},
+     {"id": "backend_b_render_frame", "label": "render_frame",
+      "file_type": "code", "source_file": "backend_b.py"}),
+    ({"id": "web_logo", "label": "logo.png",
+      "file_type": "image", "source_file": "web/assets/logo.png"},
+     {"id": "docs_logo", "label": "logo.png",
+      "file_type": "image", "source_file": "docs/img/logo.png"}),
+    ({"id": "logo_concept", "label": "logo.png",
+      "file_type": "concept", "source_file": "doc1.md"},
+     {"id": "logo_image", "label": "logo.png",
+      "file_type": "image", "source_file": "assets/logo.png"}),
+    ({"id": "shenzhen_a", "label": "Shenzhen International",
+      "file_type": "concept", "source_file": ""},
+     {"id": "shenzhen_b", "label": "Shenzhen International",
+      "file_type": "concept", "source_file": ""}),
+    ({"id": "api_a", "label": "API",
+      "file_type": "concept", "source_file": "doc1.md"},
+     {"id": "api_b", "label": "API",
+      "file_type": "concept", "source_file": "doc2.md"}),
+], ids=["document", "rationale", "code", "image-basename", "concept-image-mixed",
+        "empty-source-file", "low-entropy-concept"])
+def test_crossfile_identical_labels_stay_distinct_for_guarded_types(a, b):
+    """The #2182 fix is gated to high-entropy `concept` nodes with provenance
+    on BOTH sides. Identical labels must NOT merge for: file-anchored types
+    (document/rationale, #1284), code (#1205), images sharing a basename in
+    different dirs, mixed concept+image pairs, provenance-less nodes (#1178),
+    and low-entropy generic labels."""
+    result_nodes, _ = deduplicate_entities([dict(a), dict(b)], [], communities={})
+    assert len(result_nodes) == 2, (
+        f"guarded pair ({a['id']}, {b['id']}) was merged — #2182 fix leaked "
+        f"past its concept-only gate"
+    )
+
+
+def test_cross_repo_guard_still_raises():
+    """The cross-repo guard is untouched by #2182: identical concepts from
+    different repos must still raise, never merge."""
+    nodes = [
+        {"id": "c1", "label": "Shenzhen International", "file_type": "concept",
+         "source_file": "doc1.md", "repo": "repo-a"},
+        {"id": "c2", "label": "Shenzhen International", "file_type": "concept",
+         "source_file": "doc2.md", "repo": "repo-b"},
+    ]
+    with pytest.raises(ValueError, match="multiple repos"):
+        deduplicate_entities(nodes, [], communities={})
+
+
+def test_crossfile_concept_merge_is_order_independent():
+    """Three identical-norm concepts across three files: every input order must
+    yield the same single survivor (#2182). Winner ids differ in length so
+    _pick_winner has a unique minimum."""
+    import itertools
+    base = [
+        {"id": "shenzhen", "label": "SHENZHEN INTERNATIONAL",
+         "file_type": "concept", "source_file": "doc1.md"},
+        {"id": "shenzhen_intl", "label": "Shenzhen international",
+         "file_type": "concept", "source_file": "doc2.md"},
+        {"id": "shenzhen_international", "label": "shenzhen-international",
+         "file_type": "concept", "source_file": "doc3.md"},
+    ]
+    survivors = set()
+    for perm in itertools.permutations(base):
+        out, _ = deduplicate_entities([dict(n) for n in perm], [], communities={})
+        assert len(out) == 1
+        survivors.add(out[0]["id"])
+    assert survivors == {"shenzhen"}, f"non-deterministic survivor: {survivors}"
+
+
+def test_crossfile_concept_merge_deterministic_across_hash_seeds():
+    """#2182 determinism, #1753/#2074 precedent: the survivor must not depend on
+    PYTHONHASHSEED. pytest fixes the seed per process, so run out-of-process
+    with shuffled input."""
+    import os
+    import subprocess
+    import sys
+    script = (
+        "import random, sys\n"
+        "from graphify.dedup import deduplicate_entities\n"
+        "nodes = [\n"
+        "    {'id': 'shenzhen', 'label': 'SHENZHEN INTERNATIONAL',\n"
+        "     'file_type': 'concept', 'source_file': 'doc1.md'},\n"
+        "    {'id': 'shenzhen_intl', 'label': 'Shenzhen international',\n"
+        "     'file_type': 'concept', 'source_file': 'doc2.md'},\n"
+        "    {'id': 'shenzhen_international', 'label': 'shenzhen-international',\n"
+        "     'file_type': 'concept', 'source_file': 'doc3.md'},\n"
+        "]\n"
+        "random.Random(int(sys.argv[1])).shuffle(nodes)\n"
+        "out, _ = deduplicate_entities(nodes, [], communities={})\n"
+        "print(len(out), sorted(n['id'] for n in out)[0])\n"
+    )
+    results = set()
+    for seed in ("0", "1", "2", "3"):
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        r = subprocess.run(
+            [sys.executable, "-c", script, seed],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        results.add(r.stdout.strip().splitlines()[-1])
+    assert results == {"1 shenzhen"}, (
+        f"non-deterministic dedup across hash seeds: {results}"
+    )
+
+
+def test_crossfile_concept_merge_is_transitive():
+    """Exact cross-file matches and a punctuation variant collapse to one
+    survivor: {'Acme Corp' doc1, 'Acme Corp' doc2, 'Acme Corp.' doc3} all
+    normalize to 'acme corp' and must transitively union (#2182)."""
+    nodes = [
+        {"id": "acme_corp_one", "label": "Acme Corp",
+         "file_type": "concept", "source_file": "doc1.md"},
+        {"id": "acme_corp_two", "label": "Acme Corp",
+         "file_type": "concept", "source_file": "doc2.md"},
+        {"id": "acme_corp_three", "label": "Acme Corp.",
+         "file_type": "concept", "source_file": "doc3.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+# ── #2576: same-file labels differing by a content-word swap ──────────────────
+# Guard adopted from @wilyan09007's PR #2587, hardened: any same-position
+# distinct-content-word pair blocks (not just exactly one), and the differing
+# tokens are judged by _same_word_variant instead of bare token-level JW.
+
+def test_dedup_does_not_merge_samefile_sibling_pipeline_stages():
+    """Sibling sections of one document, named from a template, share both
+    affixes and differ in a single content word, so Jaro-Winkler's prefix bonus
+    clears the threshold on the same-file path (92.74 with the bonus, 87.90 on
+    plain Jaro). The absorbed node's edges are re-pointed at the survivor, so
+    the graph asserts relationships the document never states (#2576)."""
+    src = "docs/pipeline.md"
+    nodes = [
+        {"id": "pipeline_asset_contribution_flow", "label": "Asset Contribution Flow",
+         "file_type": "concept", "source_file": src},
+        {"id": "pipeline_asset_consumption_flow", "label": "Asset Consumption Flow",
+         "file_type": "concept", "source_file": src},
+        {"id": "pipeline_producer_personas", "label": "Producer Personas",
+         "file_type": "concept", "source_file": src},
+        {"id": "pipeline_asset_review_flow", "label": "Asset Review & Approval Flow",
+         "file_type": "concept", "source_file": src},
+    ]
+    edges = [
+        {"source": "pipeline_producer_personas",
+         "target": "pipeline_asset_contribution_flow", "relation": "references"},
+        {"source": "pipeline_asset_contribution_flow",
+         "target": "pipeline_asset_review_flow", "relation": "references"},
+    ]
+    result_nodes, result_edges = deduplicate_entities(nodes, edges, communities={})
+    assert len(result_nodes) == 4, (
+        "contribution and consumption are distinct pipeline stages"
+    )
+    assert {(e["source"], e["target"]) for e in result_edges} == {
+        ("pipeline_producer_personas", "pipeline_asset_contribution_flow"),
+        ("pipeline_asset_contribution_flow", "pipeline_asset_review_flow"),
+    }, "edges must stay on the nodes the document actually connects"
+
+
+def test_dedup_still_merges_samefile_stopword_insertion():
+    """The pair #1243 was scoped around: swapping a function word is how a
+    restatement of the same entity differs, so a stopword in either differing
+    position exempts the pair and the merge still happens (#2576)."""
+    nodes = [
+        {"id": "m1", "file_type": "concept", "source_file": "docs/metrics.md",
+         "label": "Counts-only metrics export, a read-only aggregation service"},
+        {"id": "m2", "file_type": "concept", "source_file": "docs/metrics.md",
+         "label": "Counts-only metrics export, the read-only aggregation service"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+def test_dedup_still_merges_samefile_normalization_variants():
+    """Punct/case variants norm-equal in one file (pass 1), and a fused
+    camelCase symbol vs its spaced spelling (token counts differ, so the
+    #2576 guard defers to whole-label scoring), both still merge."""
+    nodes = [
+        {"id": "am1", "label": "Authentication Manager",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+        {"id": "am2", "label": "authentication-manager",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+    nodes = [
+        {"id": "g1", "label": "getUserById",
+         "file_type": "concept", "source_file": "docs/api.md"},
+        {"id": "g2", "label": "get user by id",
+         "file_type": "concept", "source_file": "docs/api.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+def test_dedup_still_merges_samefile_typo_in_one_token():
+    """A typo inside the differing token leaves it the same word: manager and
+    managr score 97.14 against each other, so the pair is not a content-word
+    swap and still merges (#2576)."""
+    nodes = [
+        {"id": "a1", "label": "Authentication Manager",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+        {"id": "a2", "label": "Authentication Managr",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+def test_dedup_still_merges_single_token_transposition_at_length_boundary():
+    """A single-token label at the 12-char _short_label_blocked boundary with a
+    trailing transposition is a typo: same length, Damerau-Levenshtein 1, so
+    _same_word_variant exempts it and the merge survives (#2576)."""
+    nodes = [
+        {"id": "gb1", "label": "GraphBuilder",
+         "file_type": "concept", "source_file": "docs/build.md"},
+        {"id": "gb2", "label": "GraphBuildre",
+         "file_type": "concept", "source_file": "docs/build.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+def test_dedup_recovers_samefile_first_letter_typo():
+    """DELTA over #2587: token-level JW scores manager/nanager at 84.92 (the
+    prefix bonus is zero at position 0), so the PR's bare-JW token test would
+    have blocked a genuine typo. The same-length Damerau-Levenshtein<=1 branch
+    of _same_word_variant reads it as one word and the merge happens (#2576).
+    The label carries a third token so the pair clears MinHash/LSH candidacy
+    (the two-token pair's shingle Jaccard sits at 0.727, on the 0.7 blocking
+    threshold, and never reaches the comparator either way)."""
+    nodes = [
+        {"id": "a1", "label": "Authentication Session Manager",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+        {"id": "a2", "label": "Authentication Session Nanager",
+         "file_type": "concept", "source_file": "docs/auth.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+def test_dedup_does_not_merge_samefile_short_content_word_swap():
+    """DELTA over #2587: pane/plane scores 94.0 on token-level JW, above the
+    merge threshold, so the PR's bare-JW token test read two distinct short
+    words as a typo. Tokens under 6 chars never pass the JW fallback (#2576)."""
+    nodes = [
+        {"id": "p1", "label": "User Profile Pane",
+         "file_type": "concept", "source_file": "docs/ui.md"},
+        {"id": "p2", "label": "User Profile Plane",
+         "file_type": "concept", "source_file": "docs/ui.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_does_not_merge_two_position_content_swap():
+    """DELTA over #2587: the PR guard required exactly one differing token, so
+    a sibling pair that also drifts in a second position (Flow vs Flows) slid
+    back to whole-label JW (95.44) and merged. Any same-position distinct
+    content-word pair now blocks (#2576)."""
+    nodes = [
+        {"id": "h1", "label": "Customer Asset Contribution Flow Handler",
+         "file_type": "concept", "source_file": "docs/handlers.md"},
+        {"id": "h2", "label": "Customer Asset Consumption Flows Handler",
+         "file_type": "concept", "source_file": "docs/handlers.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_does_not_merge_samefile_sibling_packages():
+    """#1243's own first example, with the source file its repro used: two
+    dependencies both come from one package.json, so the cross-file scoring
+    change never applied to them and they still merged (#2576)."""
+    nodes = [
+        {"id": "jest_native", "label": "@testing-library/jest-native",
+         "file_type": "concept", "source_file": "package.json"},
+        {"id": "react_native", "label": "@testing-library/react-native",
+         "file_type": "concept", "source_file": "package.json"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_does_not_merge_same_community_dated_doc_slugs():
+    """#1243's fourth example, with the communities its repro used: the pair is
+    cross-file and scores 87.68 on plain Jaro, but both nodes sit in one
+    community and the +5 boost lifts it back to 92.68. Comparing the differing
+    tokens (fe/mob) blocks it before the boost applies (#2576)."""
+    nodes = [
+        {"id": "fe_doc", "label": "2026-05-17-phase4-fe-api-integration.md",
+         "file_type": "concept", "source_file": "a.md"},
+        {"id": "mob_doc", "label": "2026-05-17-phase4-mob-api-integration.md",
+         "file_type": "concept", "source_file": "b.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(
+        nodes, [], communities={"fe_doc": 1, "mob_doc": 1}
+    )
+    assert len(result_nodes) == 2
+
+
+def test_content_token_swap_helper():
+    """_content_token_swap fires when any same-position pair is a swap of two
+    distinct content words (#2576)."""
+    from graphify.dedup import _content_token_swap
+    assert _content_token_swap("asset contribution flow", "asset consumption flow")
+    assert _content_token_swap("testing library jest native",
+                               "testing library react native")
+    # A function word is what a restatement swaps, so either side exempts.
+    assert not _content_token_swap("export a read only", "export the read only")
+    # A typo leaves the differing token the same word.
+    assert not _content_token_swap("graph extractor", "graph extractar")
+    # DELTA over #2587: two differing content-word positions block too (the PR
+    # exempted anything but exactly one).
+    assert _content_token_swap("alpha beta gamma", "alpha delta epsilon")
+    assert _content_token_swap("customer asset contribution flow handler",
+                               "customer asset consumption flows handler")
+    # Differing token counts belong to the prefix-extension guard.
+    assert not _content_token_swap("graph extractor", "graph extractor service")
+    assert not _content_token_swap("asset flow", "asset flow")
+
+
+def test_same_word_variant_helper():
+    """_same_word_variant separates one-word misspellings from two words
+    (#2576 DELTA over #2587's bare token-JW test)."""
+    from graphify.dedup import _same_word_variant
+    assert _same_word_variant("manager", "managr")     # JW 97.14, min len 6
+    assert _same_word_variant("manager", "nanager")    # JW 84.92 but same-len DL 1
+    assert _same_word_variant("builder", "buildre")    # trailing transposition
+    assert not _same_word_variant("pane", "plane")     # JW 94.0 but short
+    assert not _same_word_variant("flow", "flows")     # short inflection: under-merge
+    assert not _same_word_variant("contribution", "consumption")
+    assert not _same_word_variant("jest", "react")
+    # Accepted trade: a length-differing 5-char spelling variant reads as two
+    # words and stays unmerged, per the never-merge-distinct-entities bar.
+    assert not _same_word_variant("colour", "color")
