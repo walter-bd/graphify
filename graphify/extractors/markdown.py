@@ -48,6 +48,58 @@ _MD_PATH_MENTION_RE = re.compile(
 _MD_BARE_MENTION_RE = re.compile(
     r'^(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)(?:\(\))?$'
 )
+# The namespace/member chain the other languages' docs write: ``App\Services\Mailer``
+# (PHP namespaces) and ``Mailer::send()`` (PHP, Rust, C++ type-qualified members).
+# Each segment is a plain identifier; the separators are ``\`` and ``::`` (#4610).
+_MD_NS_MENTION_RE = re.compile(
+    r'^[A-Za-z_]\w*(?:(?:::|\\)[A-Za-z_]\w*)+(?:\(\))?$'
+)
+# ``Foo::CONST`` names a constant and ``Foo::class`` a keyword: neither has a
+# node to land on, so the chain is not a mention.
+_MD_NS_NON_SYMBOL_RE = re.compile(r'^(?:class|[A-Z][A-Z0-9_]*)$')
+
+# An ATX heading (CommonMark): up to three spaces of indent (four is an indented
+# code block), 1-6 `#`, then whitespace and the text. An optional closing run of
+# `#` preceded by whitespace is not part of the text: `## Setup ##` is "Setup",
+# while `## C#` and `## Trailing \#` keep their `#`.
+_MD_ATX_HEADING_RE = re.compile(r'^ {0,3}(#{1,6})[ \t]+(.+)$')
+_MD_ATX_CLOSING_RE = re.compile(r'(?:^|[ \t]+)#+[ \t]*$')
+
+# A fenced code block line: a run of 3+ backticks or 3+ tildes, then the rest of
+# the line (an info string on an opener). Leading whitespace is accepted at any
+# depth, as before, so a fence inside a nested list item still counts.
+_MD_FENCE_RE = re.compile(r'^\s*(`{3,}|~{3,})(.*)$')
+
+
+def _fence_open(line: str) -> "tuple[str, int] | None":
+    """(fence char, run length) when ``line`` opens a fenced code block.
+
+    CommonMark: a backtick fence's info string may not contain a backtick, so
+    a line that starts with an inline ```` ```code``` ```` span is prose, not a
+    fence. Tilde fences have no such restriction.
+    """
+    m = _MD_FENCE_RE.match(line)
+    if not m:
+        return None
+    run, rest = m.group(1), m.group(2)
+    if run[0] == "`" and "`" in rest:
+        return None
+    return run[0], len(run)
+
+
+def _fence_closes(line: str, fence: "tuple[str, int]") -> bool:
+    """True when ``line`` closes the block opened by ``fence``.
+
+    CommonMark: the closing run uses the opener's character, is at least as
+    long, and carries nothing but whitespace after it. So ``` does not close a
+    ~~~ block, ``` does not close a ```` block (the usual way a doc shows a
+    fenced example), and ``` followed by text is content.
+    """
+    m = _MD_FENCE_RE.match(line)
+    if not m:
+        return False
+    run, rest = m.group(1), m.group(2)
+    return run[0] == fence[0] and len(run) >= fence[1] and not rest.strip()
 
 # A YAML frontmatter block is only frontmatter when the opening `---` is the
 # very first line of the file. A `---` further down is a horizontal rule and
@@ -212,6 +264,17 @@ def _vault_lookup(target: str, root: Path) -> "Path | None":
         if c[1] == suffix or c[1].endswith("/" + suffix)
     ]
     if not matches:
+        # Obsidian writes vault-relative paths, so scanning a folder below the
+        # vault root meets links that start with that folder's own path
+        # ([[Corp/wiki/Fox]] from inside Corp/, #4559). Drop the longest such
+        # leading run and match the rest from the scan root.
+        root_parts = [_nfc(p) for p in Path(root).parts]
+        for k in range(len(parts) - 1, 0, -1):
+            if parts[:k] == root_parts[-k:]:
+                rest = "/".join(parts[k:])
+                matches = [c for c in candidates if c[1] == rest]
+                break
+    if not matches:
         return None
     return min(matches)[2]
 
@@ -341,18 +404,28 @@ def _code_span_mention(span: str) -> "tuple[str | None, list[str]] | None":
     if m:
         return m.group(1), m.group(2).split("::")
     m = _MD_BARE_MENTION_RE.match(text)
-    if not m:
-        return None
-    if "." in text:
-        # ``a.b.Name`` is a qualified symbol; ``setup.py`` and ``README.md``
-        # are files. A dotted span whose last segment is a code or document
-        # extension is the latter. Other file-like spans (``pyproject.toml``)
-        # classify as a mention and are rejected at resolution, where the
-        # qualifier ``pyproject`` matches no callable's file or owner.
-        if "." + m.group(1) in CODE_EXTENSIONS or "." + m.group(1) in DOC_EXTENSIONS:
+    if m:
+        if "." in text:
+            # ``a.b.Name`` is a qualified symbol; ``setup.py`` and ``README.md``
+            # are files. A dotted span whose last segment is a code or document
+            # extension is the latter. Other file-like spans (``pyproject.toml``)
+            # classify as a mention and are rejected at resolution, where the
+            # qualifier ``pyproject`` matches no callable's file or owner.
+            if "." + m.group(1) in CODE_EXTENSIONS or "." + m.group(1) in DOC_EXTENSIONS:
+                return None
+            return None, text.rstrip("()").split(".")
+        return None, [m.group(1)]
+    # ``App\Services\Mailer`` and ``Mailer::send()``: a namespace/member chain,
+    # split on ``\`` and ``::`` the way the dotted form splits on ``.``. A span
+    # that is only a namespace root (``App\``) is dropped: it names no symbol.
+    m = _MD_NS_MENTION_RE.match(text)
+    if m:
+        body = text[:-2] if text.endswith("()") else text
+        parts = re.split(r"::|\\", body)
+        if _MD_NS_NON_SYMBOL_RE.match(parts[-1]):
             return None
-        return None, text.rstrip("()").split(".")
-    return None, [m.group(1)]
+        return None, parts
+    return None
 
 
 def extract_markdown(path: Path) -> dict:
@@ -396,8 +469,9 @@ def extract_markdown(path: Path) -> dict:
     cross-file call pass skips these raw_calls, so a mention never becomes a
     ``calls`` edge.
 
-    Fenced code blocks (``` ... ```) are skipped during parsing so their
-    contents don't get treated as headings, but no node is emitted for
+    Fenced code blocks (``` ... ``` or ~~~ ... ~~~, closed by a run of the
+    same character at least as long, per CommonMark) are skipped during
+    parsing so their contents don't get treated as headings, but no node is emitted for
     them — they were always orphans (only a single contains edge to the
     parent doc) and inflated the disconnected-component count (#1077).
 
@@ -443,6 +517,12 @@ def extract_markdown(path: Path) -> dict:
             raw_call["path"] = cited_path
         if len(names) > 1:
             raw_call["qualifiers"] = names[:-1]
+        if cited_path is None and _MD_NS_MENTION_RE.match(span.strip()):
+            # A `\`/`::` chain carries its namespace root as a qualifier the way
+            # a dotted mention does, but a PSR-4 root (`App\`) maps to the scan
+            # directory and has no path segment: the resolver may drop leading
+            # qualifiers a candidate cannot account for (#4610).
+            raw_call["ns_qualified"] = True
         raw_calls.append(raw_call)
 
     def add_node(nid: str, label: str, line: int, file_type: str = "document",
@@ -510,19 +590,20 @@ def extract_markdown(path: Path) -> dict:
 
     # Track heading stack for nesting: [(level, nid), ...]
     heading_stack: list[tuple[int, str]] = []
-    in_code_block = False
+    fence: "tuple[str, int] | None" = None  # (char, length) of the open fence
 
     for line_num_0, line_text in enumerate(lines):
         line_num = line_num_0 + 1
 
         # Skip over fenced code blocks so their contents are not parsed as
         # headings, but do not emit nodes/edges for them (#1077).
-        stripped = line_text.strip()
-        if stripped.startswith("```"):
-            in_code_block = not in_code_block
+        if fence is not None:
+            if _fence_closes(line_text, fence):
+                fence = None
             continue
-
-        if in_code_block:
+        opened = _fence_open(line_text)
+        if opened is not None:
+            fence = opened
             continue
 
         # Markdown links -> document references (#1376). Scanned on every
@@ -544,10 +625,10 @@ def extract_markdown(path: Path) -> dict:
             continue
 
         # Detect headings: # Heading, ## Heading, etc.
-        heading_match = re.match(r'^(#{1,6})\s+(.+)', line_text)
-        if heading_match:
+        heading_match = _MD_ATX_HEADING_RE.match(line_text)
+        title = _MD_ATX_CLOSING_RE.sub("", heading_match.group(2).strip()) if heading_match else ""
+        if heading_match and title:
             level = len(heading_match.group(1))
-            title = heading_match.group(2).strip()
             h_nid = _make_id(stem, title)
             # Avoid duplicate heading IDs by appending line number
             if h_nid in seen_ids:
